@@ -970,7 +970,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
         def run(self) -> None:
             try:
                 endpoint = f"https://aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{REGION}/publishers/google/models/{MODEL_ID}:generateContent"
-                token = get_auth_token()
+                token = get_access_token()
                 timeout = 120
 
                 self.log_signal.emit(f"Processing {self.image_path.name}...")
