@@ -969,7 +969,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
 
         def run(self) -> None:
             try:
-                endpoint = get_endpoint(self.project_id, REGION, MODEL_ID)
+                endpoint = f"https://aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{REGION}/publishers/google/models/{MODEL_ID}:generateContent"
                 token = get_auth_token()
                 timeout = 120
 
@@ -1012,6 +1012,37 @@ if PYQT_AVAILABLE:  # pragma: no cover
                 self.log_signal.emit(traceback.format_exc())
 
             self.done_signal.emit()
+
+
+    class DragDropLabel(QtWidgets.QLabel):
+        file_dropped = QtCore.pyqtSignal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setAcceptDrops(True)
+
+        def dragEnterEvent(self, event):
+            if event.mimeData().hasUrls():
+                urls = event.mimeData().urls()
+                if urls and urls[0].isLocalFile():
+                    file_path = urls[0].toLocalFile()
+                    # Check if it's an image file
+                    valid_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.heic', '.heif']
+                    if any(file_path.lower().endswith(ext) for ext in valid_extensions):
+                        event.acceptProposedAction()
+                    else:
+                        event.ignore()
+                else:
+                    event.ignore()
+            else:
+                event.ignore()
+
+        def dropEvent(self, event):
+            urls = event.mimeData().urls()
+            if urls and urls[0].isLocalFile():
+                file_path = urls[0].toLocalFile()
+                self.file_dropped.emit(file_path)
+                event.acceptProposedAction()
 
 
     class MainWindow(QtWidgets.QWidget):
@@ -1158,10 +1189,12 @@ if PYQT_AVAILABLE:  # pragma: no cover
             select_row.addStretch()
             input_layout.addLayout(select_row)
 
-            self.single_image_preview = QtWidgets.QLabel()
+            self.single_image_preview = DragDropLabel()
             self.single_image_preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.single_image_preview.setMinimumHeight(300)
-            self.single_image_preview.setStyleSheet("QLabel { background-color: #f0f0f0; border: 1px solid #ccc; }")
+            self.single_image_preview.setStyleSheet("QLabel { background-color: #f0f0f0; border: 2px dashed #999; color: #666; } QLabel:hover { border-color: #4a90e2; }")
+            self.single_image_preview.setText("Drop image here or click 'Select Image'")
+            self.single_image_preview.file_dropped.connect(self.on_image_dropped)
             input_layout.addWidget(self.single_image_preview)
             input_group.setLayout(input_layout)
             layout.addWidget(input_group)
@@ -1172,6 +1205,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
             self.single_prompt_edit = QtWidgets.QTextEdit()
             self.single_prompt_edit.setPlainText(PROMPT)
             self.single_prompt_edit.setMaximumHeight(150)
+            self.single_prompt_edit.setStyleSheet("QTextEdit { background-color: #ffffff; color: #000000; }")
             prompt_layout.addWidget(self.single_prompt_edit)
             prompt_group.setLayout(prompt_layout)
             layout.addWidget(prompt_group)
@@ -1201,6 +1235,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
             custom_row.addSpacing(20)
             self.single_output_path_edit = QtWidgets.QLineEdit()
             self.single_output_path_edit.setEnabled(False)
+            self.single_output_path_edit.setStyleSheet("QLineEdit { background-color: #ffffff; color: #000000; }")
             custom_row.addWidget(self.single_output_path_edit)
             self.single_output_browse_btn = QtWidgets.QPushButton("Browse")
             self.single_output_browse_btn.setEnabled(False)
@@ -1212,6 +1247,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
             suffix_row.addWidget(QtWidgets.QLabel("Filename suffix:"))
             self.single_filename_suffix = QtWidgets.QLineEdit()
             self.single_filename_suffix.setPlaceholderText("e.g., _restored")
+            self.single_filename_suffix.setStyleSheet("QLineEdit { background-color: #ffffff; color: #000000; }")
             suffix_row.addWidget(self.single_filename_suffix)
             config_layout.addLayout(suffix_row)
 
@@ -1507,6 +1543,24 @@ if PYQT_AVAILABLE:  # pragma: no cover
 
                 # Enable process button
                 self.single_process_btn.setEnabled(True)
+
+        def on_image_dropped(self, path: str) -> None:
+            self.single_image_path = Path(path)
+            self.single_image_path_label.setText(path)
+
+            # Load and display preview
+            try:
+                pixmap = QtGui.QPixmap(path)
+                if pixmap.isNull():
+                    self.single_image_path_label.setText(f"{path} (preview not available)")
+                else:
+                    scaled = pixmap.scaledToWidth(400, QtCore.Qt.TransformationMode.SmoothTransformation)
+                    self.single_image_preview.setPixmap(scaled)
+            except Exception as e:
+                self.single_image_path_label.setText(f"{path} (error loading preview: {e})")
+
+            # Enable process button
+            self.single_process_btn.setEnabled(True)
 
         def toggle_output_location(self, checked: bool) -> None:
             if checked:
