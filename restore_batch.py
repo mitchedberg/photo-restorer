@@ -371,7 +371,7 @@ def ensure_output_dir(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def build_payload(prompt: str, encoded_image: str, mime: str) -> dict:
+def build_payload(prompt: str, encoded_image: str, mime: str, image_size: str = "4K") -> dict:
     return {
         "contents": [
             {
@@ -386,7 +386,7 @@ def build_payload(prompt: str, encoded_image: str, mime: str) -> dict:
             "temperature": 0.2,
             "candidateCount": 1,
             "responseModalities": ["IMAGE"],
-            "imageConfig": {"imageSize": "4K"},
+            "imageConfig": {"imageSize": image_size},
         },
     }
 
@@ -484,11 +484,12 @@ def process_one_image(
     dry_run: bool = False,
     progress_callback: Optional[Callable[[dict], None]] = None,
     db_row_id: Optional[int] = None,
+    image_size: str = "4K",
 ) -> Tuple[bool, bool]:
     """Returns (success, blocked). blocked=True when the API refuses content."""
     max_retries = 10
     encoded, mime, input_hash = read_image_b64(image_path)
-    payload = build_payload(prompt, encoded, mime)
+    payload = build_payload(prompt, encoded, mime, image_size)
     start_time = time.time()
 
     if dry_run:
@@ -953,6 +954,66 @@ if PYQT_AVAILABLE:  # pragma: no cover
             self.done_signal.emit()
 
 
+    class SingleImageWorker(QtCore.QThread):
+        log_signal = QtCore.pyqtSignal(str)
+        result_signal = QtCore.pyqtSignal(str, str)
+        done_signal = QtCore.pyqtSignal()
+
+        def __init__(self, image_path: Path, output_path: Path, prompt: str, image_size: str, project_id: str):
+            super().__init__()
+            self.image_path = image_path
+            self.output_path = output_path
+            self.prompt = prompt
+            self.image_size = image_size
+            self.project_id = project_id
+
+        def run(self) -> None:
+            try:
+                endpoint = get_endpoint(self.project_id, REGION, MODEL_ID)
+                token = get_auth_token()
+                timeout = 120
+
+                self.log_signal.emit(f"Processing {self.image_path.name}...")
+
+                db_row_id = log_image_start(self.image_path, self.output_path)
+
+                success, blocked = process_one_image(
+                    index=0,
+                    total=1,
+                    image_path=self.image_path,
+                    output_path=self.output_path,
+                    endpoint=endpoint,
+                    token=token,
+                    prompt=self.prompt,
+                    timeout=timeout,
+                    log=self.log_signal.emit,
+                    dry_run=False,
+                    progress_callback=None,
+                    db_row_id=db_row_id,
+                    image_size=self.image_size
+                )
+
+                if success:
+                    self.result_signal.emit(str(self.output_path), "")
+                    self.log_signal.emit(f"Successfully processed: {self.output_path}")
+                elif blocked:
+                    error_msg = "Content blocked by model safety filters"
+                    self.result_signal.emit("", error_msg)
+                    self.log_signal.emit(f"Error: {error_msg}")
+                else:
+                    error_msg = "Processing failed (see logs for details)"
+                    self.result_signal.emit("", error_msg)
+                    self.log_signal.emit(f"Error: {error_msg}")
+
+            except Exception as e:
+                error_msg = str(e)
+                self.result_signal.emit("", error_msg)
+                self.log_signal.emit(f"Exception: {error_msg}")
+                self.log_signal.emit(traceback.format_exc())
+
+            self.done_signal.emit()
+
+
     class MainWindow(QtWidgets.QWidget):
         def __init__(self, prompt: str):
             super().__init__()
@@ -966,6 +1027,38 @@ if PYQT_AVAILABLE:  # pragma: no cover
 
         def init_ui(self) -> None:
             self.setWindowTitle("Gemini 4K Restorer")
+            main_layout = QtWidgets.QVBoxLayout()
+
+            # Create tab widget
+            self.tabs = QtWidgets.QTabWidget()
+
+            # Build batch processing tab
+            batch_tab = self._build_batch_tab()
+            single_tab = self._build_single_image_tab()
+
+            self.tabs.addTab(batch_tab, "Batch Processing")
+            self.tabs.addTab(single_tab, "Single Image")
+
+            main_layout.addWidget(self.tabs)
+            self.setLayout(main_layout)
+
+            # Prefill paths after widgets exist
+            if self.prefs.get("input_path"):
+                self.input_edit.setText(self.prefs["input_path"])
+            if self.prefs.get("output_path"):
+                self.output_edit.setText(self.prefs["output_path"])
+            self.populate_projects(log=False)
+
+            # Keep stats reactive
+            self.max_spin.valueChanged.connect(self.update_stats)
+            self.start_spin.valueChanged.connect(self.update_stats)
+
+            self.update_stats()
+            # Auto-check account/billing shortly after launch (non-blocking enough for UI).
+            QtCore.QTimer.singleShot(250, self.check_billing)
+
+        def _build_batch_tab(self) -> QtWidgets.QWidget:
+            batch_widget = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout()
 
             self.input_edit = QtWidgets.QLineEdit()
@@ -1037,29 +1130,129 @@ if PYQT_AVAILABLE:  # pragma: no cover
 
             self.start_btn = QtWidgets.QPushButton("Start Batch")
             self.start_btn.clicked.connect(self.start_batch)
-            
+
             layout.addWidget(self.start_btn)
 
             self.log_box = QtWidgets.QTextEdit()
             self.log_box.setReadOnly(True)
             layout.addWidget(self.log_box)
 
-            self.setLayout(layout)
+            batch_widget.setLayout(layout)
+            return batch_widget
 
-            # Prefill paths after widgets exist
-            if self.prefs.get("input_path"):
-                self.input_edit.setText(self.prefs["input_path"])
-            if self.prefs.get("output_path"):
-                self.output_edit.setText(self.prefs["output_path"])
-            self.populate_projects(log=False)
+        def _build_single_image_tab(self) -> QtWidgets.QWidget:
+            single_widget = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout()
 
-            # Keep stats reactive
-            self.max_spin.valueChanged.connect(self.update_stats)
-            self.start_spin.valueChanged.connect(self.update_stats)
+            # Input Section
+            input_group = QtWidgets.QGroupBox("Input Image")
+            input_layout = QtWidgets.QVBoxLayout()
 
-            self.update_stats()
-            # Auto-check account/billing shortly after launch (non-blocking enough for UI).
-            QtCore.QTimer.singleShot(250, self.check_billing)
+            select_row = QtWidgets.QHBoxLayout()
+            self.single_select_btn = QtWidgets.QPushButton("Select Image")
+            self.single_select_btn.clicked.connect(self.select_single_image)
+            select_row.addWidget(self.single_select_btn)
+
+            self.single_image_path_label = QtWidgets.QLabel("No image selected")
+            select_row.addWidget(self.single_image_path_label)
+            select_row.addStretch()
+            input_layout.addLayout(select_row)
+
+            self.single_image_preview = QtWidgets.QLabel()
+            self.single_image_preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.single_image_preview.setMinimumHeight(300)
+            self.single_image_preview.setStyleSheet("QLabel { background-color: #f0f0f0; border: 1px solid #ccc; }")
+            input_layout.addWidget(self.single_image_preview)
+            input_group.setLayout(input_layout)
+            layout.addWidget(input_group)
+
+            # Prompt Section
+            prompt_group = QtWidgets.QGroupBox("Custom Prompt")
+            prompt_layout = QtWidgets.QVBoxLayout()
+            self.single_prompt_edit = QtWidgets.QTextEdit()
+            self.single_prompt_edit.setPlainText(PROMPT)
+            self.single_prompt_edit.setMaximumHeight(150)
+            prompt_layout.addWidget(self.single_prompt_edit)
+            prompt_group.setLayout(prompt_layout)
+            layout.addWidget(prompt_group)
+
+            # Size and Output Section
+            config_group = QtWidgets.QGroupBox("Output Configuration")
+            config_layout = QtWidgets.QVBoxLayout()
+
+            size_row = QtWidgets.QHBoxLayout()
+            size_row.addWidget(QtWidgets.QLabel("Output Size:"))
+            self.single_size_combo = QtWidgets.QComboBox()
+            self.single_size_combo.addItems(["4K", "REGULAR"])
+            self.single_size_combo.setCurrentText("4K")
+            size_row.addWidget(self.single_size_combo)
+            size_row.addStretch()
+            config_layout.addLayout(size_row)
+
+            self.single_output_alongside = QtWidgets.QRadioButton("Save alongside input")
+            self.single_output_alongside.setChecked(True)
+            self.single_output_alongside.toggled.connect(self.toggle_output_location)
+            config_layout.addWidget(self.single_output_alongside)
+
+            self.single_output_custom = QtWidgets.QRadioButton("Custom output location:")
+            config_layout.addWidget(self.single_output_custom)
+
+            custom_row = QtWidgets.QHBoxLayout()
+            custom_row.addSpacing(20)
+            self.single_output_path_edit = QtWidgets.QLineEdit()
+            self.single_output_path_edit.setEnabled(False)
+            custom_row.addWidget(self.single_output_path_edit)
+            self.single_output_browse_btn = QtWidgets.QPushButton("Browse")
+            self.single_output_browse_btn.setEnabled(False)
+            self.single_output_browse_btn.clicked.connect(self.pick_single_output)
+            custom_row.addWidget(self.single_output_browse_btn)
+            config_layout.addLayout(custom_row)
+
+            suffix_row = QtWidgets.QHBoxLayout()
+            suffix_row.addWidget(QtWidgets.QLabel("Filename suffix:"))
+            self.single_filename_suffix = QtWidgets.QLineEdit()
+            self.single_filename_suffix.setPlaceholderText("e.g., _restored")
+            suffix_row.addWidget(self.single_filename_suffix)
+            config_layout.addLayout(suffix_row)
+
+            config_group.setLayout(config_layout)
+            layout.addWidget(config_group)
+
+            # Process Button and Progress
+            self.single_process_btn = QtWidgets.QPushButton("Process Image")
+            self.single_process_btn.setEnabled(False)
+            self.single_process_btn.clicked.connect(self.process_single_image)
+            layout.addWidget(self.single_process_btn)
+
+            self.single_progress = QtWidgets.QProgressBar()
+            self.single_progress.setRange(0, 0)
+            self.single_progress.setVisible(False)
+            layout.addWidget(self.single_progress)
+
+            # Result Section
+            result_group = QtWidgets.QGroupBox("Result")
+            result_layout = QtWidgets.QVBoxLayout()
+
+            self.single_result_label = QtWidgets.QLabel("No result yet")
+            result_layout.addWidget(self.single_result_label)
+
+            self.single_result_preview = QtWidgets.QLabel()
+            self.single_result_preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.single_result_preview.setMinimumHeight(300)
+            self.single_result_preview.setStyleSheet("QLabel { background-color: #f0f0f0; border: 1px solid #ccc; }")
+            result_layout.addWidget(self.single_result_preview)
+
+            result_group.setLayout(result_layout)
+            layout.addWidget(result_group)
+
+            layout.addStretch()
+            single_widget.setLayout(layout)
+
+            # Initialize instance variables for single image processing
+            self.single_image_path = None
+            self.single_worker = None
+
+            return single_widget
 
         def _with_row(self, widget: QtWidgets.QWidget, button: QtWidgets.QWidget) -> QtWidgets.QWidget:
             row = QtWidgets.QHBoxLayout()
@@ -1289,6 +1482,126 @@ if PYQT_AVAILABLE:  # pragma: no cover
         def batch_done(self) -> None:
             self.start_btn.setEnabled(True)
             self.append_log("Done.")
+
+        def select_single_image(self) -> None:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select Image",
+                "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.gif *.heic *.heif);;All Files (*)"
+            )
+            if path:
+                self.single_image_path = Path(path)
+                self.single_image_path_label.setText(path)
+
+                # Load and display preview
+                try:
+                    pixmap = QtGui.QPixmap(path)
+                    if pixmap.isNull():
+                        self.single_image_path_label.setText(f"{path} (preview not available)")
+                    else:
+                        scaled = pixmap.scaledToWidth(400, QtCore.Qt.TransformationMode.SmoothTransformation)
+                        self.single_image_preview.setPixmap(scaled)
+                except Exception as e:
+                    self.single_image_path_label.setText(f"{path} (error loading preview: {e})")
+
+                # Enable process button
+                self.single_process_btn.setEnabled(True)
+
+        def toggle_output_location(self, checked: bool) -> None:
+            if checked:
+                self.single_output_path_edit.setEnabled(False)
+                self.single_output_browse_btn.setEnabled(False)
+            else:
+                self.single_output_path_edit.setEnabled(True)
+                self.single_output_browse_btn.setEnabled(True)
+
+        def pick_single_output(self) -> None:
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
+            if path:
+                self.single_output_path_edit.setText(path)
+
+        def process_single_image(self) -> None:
+            if not self.single_image_path:
+                QtWidgets.QMessageBox.warning(self, "No Image", "Please select an image first.")
+                return
+
+            # Determine output path
+            if self.single_output_alongside.isChecked():
+                output_dir = self.single_image_path.parent
+            else:
+                custom_path = self.single_output_path_edit.text().strip()
+                if not custom_path:
+                    QtWidgets.QMessageBox.warning(self, "No Output", "Please select an output location.")
+                    return
+                output_dir = Path(custom_path)
+                if not output_dir.exists():
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Determine output filename
+            suffix = self.single_filename_suffix.text().strip()
+            size_str = self.single_size_combo.currentText()
+
+            if suffix:
+                output_filename = f"{self.single_image_path.stem}{suffix}.png"
+            else:
+                output_filename = f"PRO_{size_str}_{self.single_image_path.stem}.png"
+
+            output_path = output_dir / output_filename
+
+            # Get custom prompt and size
+            custom_prompt = self.single_prompt_edit.toPlainText().strip()
+            if not custom_prompt:
+                custom_prompt = PROMPT
+
+            # Start processing
+            self.single_process_btn.setEnabled(False)
+            self.single_progress.setVisible(True)
+            self.single_result_label.setText("Processing...")
+
+            try:
+                project_id = get_project_id()
+            except RuntimeError as e:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Project Error",
+                    f"Failed to get project ID: {e}\nPlease set a project in the Batch Processing tab."
+                )
+                self.single_process_btn.setEnabled(True)
+                self.single_progress.setVisible(False)
+                return
+
+            self.single_worker = SingleImageWorker(
+                image_path=self.single_image_path,
+                output_path=output_path,
+                prompt=custom_prompt,
+                image_size=size_str,
+                project_id=project_id
+            )
+            self.single_worker.log_signal.connect(self.append_log)
+            self.single_worker.result_signal.connect(self.on_single_image_result)
+            self.single_worker.done_signal.connect(self.on_single_image_done)
+            self.single_worker.start()
+
+        def on_single_image_result(self, output_path: str, error: str) -> None:
+            if error:
+                self.single_result_label.setText(f"Error: {error}")
+                QtWidgets.QMessageBox.critical(self, "Processing Error", f"Failed to process image:\n{error}")
+            else:
+                self.single_result_label.setText(f"Success! Saved to: {output_path}")
+
+                # Load and display result preview
+                try:
+                    pixmap = QtGui.QPixmap(output_path)
+                    if not pixmap.isNull():
+                        scaled = pixmap.scaledToWidth(400, QtCore.Qt.TransformationMode.SmoothTransformation)
+                        self.single_result_preview.setPixmap(scaled)
+                except Exception as e:
+                    self.single_result_label.setText(f"{output_path} (error loading preview: {e})")
+
+        def on_single_image_done(self) -> None:
+            self.single_process_btn.setEnabled(True)
+            self.single_progress.setVisible(False)
 
         def save_prefs(self) -> None:
             data = {
