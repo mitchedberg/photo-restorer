@@ -1265,6 +1265,17 @@ if PYQT_AVAILABLE:  # pragma: no cover
             self.single_progress.setVisible(False)
             layout.addWidget(self.single_progress)
 
+            # Log Section
+            log_group = QtWidgets.QGroupBox("Processing Log")
+            log_layout = QtWidgets.QVBoxLayout()
+            self.single_log_box = QtWidgets.QTextEdit()
+            self.single_log_box.setReadOnly(True)
+            self.single_log_box.setMaximumHeight(150)
+            self.single_log_box.setStyleSheet("QTextEdit { background-color: #ffffff; color: #000000; font-family: monospace; }")
+            log_layout.addWidget(self.single_log_box)
+            log_group.setLayout(log_layout)
+            layout.addWidget(log_group)
+
             # Result Section
             result_group = QtWidgets.QGroupBox("Result")
             result_layout = QtWidgets.QVBoxLayout()
@@ -1612,6 +1623,7 @@ if PYQT_AVAILABLE:  # pragma: no cover
             self.single_process_btn.setEnabled(False)
             self.single_progress.setVisible(True)
             self.single_result_label.setText("Processing...")
+            self.single_log_box.clear()
 
             try:
                 project_id = get_project_id()
@@ -1632,10 +1644,13 @@ if PYQT_AVAILABLE:  # pragma: no cover
                 image_size=size_str,
                 project_id=project_id
             )
-            self.single_worker.log_signal.connect(self.append_log)
+            self.single_worker.log_signal.connect(self.append_single_log)
             self.single_worker.result_signal.connect(self.on_single_image_result)
             self.single_worker.done_signal.connect(self.on_single_image_done)
             self.single_worker.start()
+
+        def append_single_log(self, text: str) -> None:
+            self.single_log_box.append(text)
 
         def on_single_image_result(self, output_path: str, error: str) -> None:
             if error:
